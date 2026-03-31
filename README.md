@@ -1,6 +1,6 @@
 # Build Harness Skill for Claude Code
 
-A Claude Code skill that creates, maintains, and executes project-specific build scripts. Born from three failed OrcaSlicer build attempts on Windows — PATH issues, output capture failures, MSYS2 flag mangling — and refined through automated code review.
+A Claude Code skill that creates, maintains, and executes project-specific build scripts. Platform-agnostic — works with any build system, OS, and shell. Born from real build failures, refined through automated code review.
 
 ## What It Does
 
@@ -12,30 +12,41 @@ When you need to build a project, the skill:
 4. **Executes** builds with output capture, priority enforcement, and staleness detection
 5. **Persists** the harness in memory so it survives conversation compaction
 
+## Supported Build Systems
+
+CMake, MSBuild, Make, Cargo (Rust), Go, npm/yarn/pnpm, Gradle, Maven, Meson, Bazel, xmake, SCons, Autotools, and Just. The skill discovers which one you're using and generates appropriate commands.
+
+## Supported Platforms
+
+| Platform | Priority Enforcement | Timestamp Method | Notes |
+|----------|---------------------|------------------|-------|
+| Linux | `nice -n 10` (covers children) | `stat -c %Y` | Simplest path |
+| macOS | `nice -n 10` | `stat -f %m` | BSD stat syntax |
+| Windows (MSYS2/Git Bash) | PowerShell watchdog | `stat -c %Y` (GNU) | Use `-flag` not `/flag` for MSBuild |
+| Windows (PowerShell) | Native priority | `(Get-Item).LastWriteTime` | Different script structure |
+
 ## Key Features
 
-- **Toolchain discovery** — finds compilers via `vswhere.exe` (Windows) or standard paths, never assumes PATH
-- **Shell compatibility** — handles MSYS2/Git Bash flag mangling (`-p:` not `/p:`)
-- **Priority enforcement** — watchdog process keeps builds at BelowNormal/nice, catches child processes
+- **Toolchain discovery** — finds compilers via `vswhere` (Windows), `which`/`command -v`, or platform-specific methods. Never assumes PATH.
+- **Shell compatibility** — handles MSYS2/Cygwin flag mangling, BSD vs GNU `stat`, fish shell limitations
+- **Priority enforcement** — `nice` on Unix, PowerShell watchdog on Windows, with trap-based cleanup
 - **Staleness detection** — warns when artifacts weren't actually updated by the build
-- **Full artifact snapshots** — copies entire Release directory with `{hash}_{note}` naming and MD5 verification
-- **Post-compaction recovery** — memory files let new sessions use existing harnesses immediately
+- **Artifact snapshots** — copies output with integrity verification and configurable naming
+- **Post-compaction recovery** — memory files let new sessions use existing harnesses without rediscovery
 
 ## The Skill Workflow
 
-The skill operates in six phases, each assigned an appropriate model tier:
-
 | Phase | Activity | Model Tier |
 |-------|----------|------------|
-| 0 | Check memory for existing harness | Direct (no agent) |
-| 1 | Workspace discovery (build system, toolchain, layout) | Haiku (fast scan) |
-| 2 | Script generation | Sonnet (build expertise) |
-| 3 | Review pipeline (Gimli + Aragorn + adversarial) | Sonnet + Haiku |
-| 4 | Execute build with monitoring | Direct (bash) |
-| 5 | Persist harness to memory | Direct (write) |
-| 6 | Interview user about preferences (first time) | Direct (ask) |
+| 0 | Check memory for existing harness | Direct |
+| 1 | Workspace discovery (build system, toolchain, layout) | Haiku |
+| 2 | Script generation | Sonnet |
+| 3 | Review pipeline (build + security + adversarial) | Sonnet |
+| 4 | Execute build with monitoring | Direct |
+| 5 | Persist harness to memory | Direct |
+| 6 | Interview user about preferences (first time) | Direct |
 
-Phase 0 is the key to surviving conversation compaction — the harness and its usage are stored in a memory file, so a fresh session can find and use it without rediscovery.
+Phase 0 is the compaction survival mechanism — the harness and its usage are stored in a memory file, so a fresh session finds and uses it without rediscovery.
 
 ## Installation
 
@@ -48,64 +59,28 @@ cp SKILL.md ~/.claude/skills/build-harness/
 
 The skill auto-registers and triggers on build-related requests.
 
-## Reference Implementation
+## Example
 
-See `examples/orcaslicer_build.sh` — a build harness for OrcaSlicer across three git worktrees with MSBuild on Windows.
+See `examples/orcaslicer_build.sh` for a Windows/MSBuild reference implementation — a build harness for OrcaSlicer across three git worktrees.
 
 ```bash
-# Incremental lib build (fastest, after editing one .cpp)
+# Incremental lib build
 ./build.sh snuggle lib
 
-# Build DLL with full snapshot to builds/{hash}_{note}/
-./build.sh snuggle dll --snapshot --note=radial_snuggle
+# Full build with snapshot
+./build.sh snuggle dll --snapshot --note=my_feature
 
-# Clean rebuild, all cores (AFK only)
+# AFK full rebuild
 ./build.sh v1 all --afk --clean
-
-# Snapshot with auto-generated note from commit message
-./build.sh v2 dll --snapshot
 ```
-
-### Snapshot format
-
-Snapshots copy the entire Release directory (all DLLs, resources, ~664MB) into a folder named `{10-char-hash}_{descriptive_note}`:
-
-```
-builds/
-  bf2c3ddb85_radial_snuggle_clean/
-    OrcaSlicer.dll
-    TKBO.dll
-    TKBRep.dll
-    ...
-    resources/
-  a3c7b4b062_snuggle_adaptive/
-    ...
-```
-
-The DLL is MD5-verified against the build output. The commit hash and message are printed so you know exactly what code produced the snapshot.
 
 ## Review History
 
-The skill and reference implementation were reviewed by the [Lord of the Code](https://github.com/thereprocase) framework:
+The skill was reviewed by:
+- **Gimli** (build systems) — 16 findings including locked-file check, Linux nice/renice path, watchdog self-test placement
+- **Gandalf** (architecture) — 7 findings including Phase 0 probe step, multi-build-system template gaps, reviewer conflict resolution
 
-- **Gimli** (Sonnet, build systems) — 16 findings, 3 HIGH: watchdog self-test placement, Linux nice/renice gap, locked DLL check
-- **Gandalf** (Sonnet, architecture) — 7 findings: Phase 0 probe step, model tier for adversarial testing, multi-build-system template gaps
-- **Aragorn** (security/robustness) — scoped into Gimli's review
-
-Key fixes applied:
-- Clean phase runs as separate MSBuild invocation (not appended to target list)
-- Watchdog has trap-based cleanup (no leaked processes on Ctrl-C)
-- `BUILD_EXIT=$?` capture pattern prevents `set -e` from killing the script before cleanup
-- MSYS2 flag mangling handled with `-` prefix (not `/`) for all MSBuild switches
-- Staleness detection compares artifact timestamps against build start time
-- Full Release directory snapshots with `{hash}_{note}` naming convention
-
-## Known Limitations
-
-- Priority watchdog is Windows-only (PowerShell). Linux/macOS should use `nice -n 10` on the build command instead.
-- `stat -c` syntax is GNU (Linux/MSYS2). BSD (macOS) uses `stat -f`.
-- No pre-build check for locked DLL/EXE (will fail at link time if OrcaSlicer is running).
-- `vswhere` drive letter lowercasing uses GNU sed `\L` — won't work with BSD sed.
+Findings were incorporated into the platform-agnostic rewrite.
 
 ## License
 

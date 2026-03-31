@@ -14,7 +14,7 @@ Before doing anything else, check memory for a build harness reference:
 
 1. Read the project's `MEMORY.md` index for any entry mentioning "build harness" or "build script"
 2. If found, read the referenced memory file to get the script path and usage
-3. Verify the script still exists at that path
+3. Verify the script still exists at that path and probe it (e.g., `bash build.sh --help` or dry-run) to confirm it's functional
 4. If it exists and is current: **use it directly** — skip to Phase 4 (Execute)
 5. If it exists but is stale or broken: proceed to Phase 2 (Repair) instead of Phase 1
 
@@ -25,35 +25,70 @@ This phase is critical for post-compaction recovery. The memory file IS the cont
 Deploy a **Haiku-tier** agent to scan the workspace quickly and build context. The agent should:
 
 ### 1a. Identify the build system
-- Scan for: `CMakeLists.txt`, `Makefile`, `*.sln`, `*.vcxproj`, `package.json`, `Cargo.toml`, `go.mod`, `build.gradle`, `meson.build`, `*.pro`
-- Check for build directories: `build/`, `out/`, `target/`, `dist/`, `node_modules/`
-- Identify the toolchain: MSVC, GCC, Clang, Rust, Go, Node, etc.
+Scan for project files and infer the build system:
+
+| File | Build System |
+|------|-------------|
+| `CMakeLists.txt` | CMake (+ generator: Make, Ninja, MSBuild) |
+| `Makefile`, `GNUmakefile` | Make |
+| `*.sln`, `*.vcxproj` | MSBuild / Visual Studio |
+| `Cargo.toml` | Cargo (Rust) |
+| `go.mod` | Go |
+| `package.json` | npm / yarn / pnpm (Node) |
+| `pyproject.toml`, `setup.py` | pip / setuptools (Python) |
+| `build.gradle`, `build.gradle.kts` | Gradle (Java/Kotlin) |
+| `pom.xml` | Maven (Java) |
+| `meson.build` | Meson |
+| `BUILD`, `WORKSPACE` | Bazel |
+| `justfile` | Just (task runner, often wraps another system) |
+| `Makefile.am`, `configure.ac` | Autotools |
+| `xmake.lua` | xmake |
+| `SConstruct` | SCons |
+
+Check for build output directories: `build/`, `cmake-build-*/`, `out/`, `target/`, `dist/`, `_build/`, `.build/`, `node_modules/`
 
 ### 1b. Discover the environment
-- OS and shell (bash on Windows via MSYS2/Git Bash is common and has pitfalls)
-- Tool paths: compiler, linker, build system binary. **Never assume PATH.** Always verify with `which` or full path discovery.
-- For MSVC on Windows: use `vswhere.exe` first, then check known VS install paths. The `/` vs `-` flag prefix matters in MSYS2 bash.
+- **OS**: Linux, macOS, Windows
+- **Shell**: bash, zsh, fish, PowerShell. Note if running a compatibility layer (MSYS2, Cygwin, WSL)
+- **Tool paths**: find the build tool binary. **Never assume it's on PATH.** Verify with `which`/`where`/`command -v`, and use platform-specific discovery when available:
+
+| Platform | Discovery method |
+|----------|-----------------|
+| Windows (MSVC) | `vswhere.exe` for VS install path, then known MSBuild subdirectory |
+| Windows (MSYS2/Cygwin) | `which` may miss Windows-native tools — also check `where` via `cmd.exe` |
+| Linux/macOS | `which` / `command -v` is usually sufficient |
+| Rust | `rustup which cargo` for toolchain-specific path |
+| Node | `npx --yes which` or check `node_modules/.bin/` |
+
+**Shell pitfalls by platform:**
+
+| Shell | Pitfall |
+|-------|---------|
+| MSYS2 / Git Bash | Converts `/flag` to a Windows path. Use `-flag` for MSBuild switches, or set `MSYS2_ARG_CONV_EXCL` |
+| Cygwin | Same path mangling as MSYS2 |
+| WSL1 | Path translation quirks when calling Windows binaries |
+| fish | No `set -euo pipefail` equivalent — use `fish_exit_status` or write harness in bash |
 
 ### 1c. Map the workspace structure
 - Multiple worktrees? List them with branches.
 - Multiple build configurations (Debug/Release/RelWithDebInfo)?
 - Dependency builds? (deps/ directories with their own build)
-- Output artifacts: what gets produced and where? (.exe, .dll, .lib, .so, .wasm, etc.)
+- Output artifacts: what gets produced and where?
 
 ### 1d. Review build history and user preferences
 - Check memory files for build-related feedback (priority, parallelism, snapshots)
 - Check git log for build-related commits or build failure fix patterns
-- Check for existing build scripts, Makefiles, CI configs
+- Check for existing build scripts, CI configs (`.github/workflows/`, `Jenkinsfile`, `.gitlab-ci.yml`)
 - Look for build log files that reveal past failures
 
 ### 1e. Produce a discovery report
-Format:
 ```
 Build System: [CMake/MSBuild/cargo/etc.]
 Toolchain: [MSVC 2022/GCC 13/rustc 1.75/etc.]
 Tool Path: [full path to build binary]
-Shell: [bash/zsh/powershell] on [OS]
-Shell Pitfalls: [MSYS2 path mangling, etc.]
+OS: [Linux/macOS/Windows]
+Shell: [bash/zsh/powershell]
+Shell Pitfalls: [if any]
 Worktrees: [list with branches]
 Configurations: [Release/Debug/etc.]
 Output Artifacts: [what, where]
@@ -62,30 +97,49 @@ Known Preferences: [from memory]
 
 ## Phase 2 — Script Generation
 
-Deploy a **Sonnet-tier** agent (Gimli, conceptually) to write the build script. The script MUST handle:
+Deploy a **Sonnet-tier** agent to write the build script. The script MUST handle:
 
 ### Required features (non-negotiable)
-1. **Toolchain discovery** — find the compiler/build tool by reliable means, not PATH assumption
-2. **Shell compatibility** — handle MSYS2/Git Bash flag mangling (use `-flag` not `/flag` for MSBuild)
-3. **Output capture** — all build output must be visible to the caller. No `start`, no `cmd.exe /c` wrappers that swallow output.
-4. **Error propagation** — non-zero exit codes must surface. `set -euo pipefail` with correct handling of intentional failures.
-5. **Staleness detection** — compare artifact timestamps against build start time. Warn if nothing was updated.
+1. **Toolchain discovery** — find the build tool by reliable means, not PATH assumption
+2. **Shell compatibility** — handle platform-specific flag syntax and path conventions
+3. **Output capture** — all build output must be visible to the caller. No subprocess wrappers that swallow output.
+4. **Error propagation** — non-zero exit codes must surface. Use `set -euo pipefail` (bash/zsh) with the `|| EXIT_CODE=$?` pattern to capture exit codes without triggering early termination before cleanup runs.
+5. **Staleness detection** — compare artifact timestamps against build start time. Warn if nothing was updated. Use portable timestamp methods (`stat -c %Y` on Linux/MSYS2, `stat -f %m` on macOS, or `python3 -c "import os; print(int(os.path.getmtime(...)))"` for full portability).
 6. **Argument parsing** — positional args for workspace/target, `--flags` for options. Sensible defaults.
-7. **Help text** — usage block at the top of the script
+7. **Echo the build command** before invoking it — invaluable for debugging flag issues.
+8. **Help text** — usage block at the top of the script
 
 ### User-preference features (encode from memory/discovery)
-1. **Process priority** — if user prefers low-priority builds (BelowNormal/nice), implement a watchdog that enforces it on all child processes, not just the parent
-2. **Parallelism** — default to coexist level (e.g., `-m:4`, `-j4`), with an `--afk` flag for full parallel
-3. **Artifact snapshots** — copy output to a versioned directory with integrity verification (MD5/SHA256)
-4. **Clean builds** — as a separate invocation before the build, never appended to the same command
+1. **Process priority** — if user prefers low-priority builds, enforce on all child processes:
+   - **Linux/macOS**: launch build with `nice -n 10` (covers all children automatically)
+   - **Windows**: priority watchdog subshell that polls and lowers `msbuild`, `cl`, `link` via PowerShell
+2. **Parallelism** — default to coexist level (e.g., `-j4`, `-m:4`), with `--afk` flag for full parallel
+3. **Artifact snapshots** — copy output to a versioned directory with integrity verification (MD5/SHA256). Use `{hash}_{descriptive_note}` folder naming if the project has an established snapshot convention.
+4. **Clean builds** — as a separate invocation before the build, never appended to the same command (MSBuild will run targets in append order, not sequentially)
 
-### Priority watchdog requirements (when applicable)
-- Start as a background subshell
+### Priority watchdog (Windows-specific, when `nice` is not available)
+- Self-test tooling (e.g., PowerShell) **once before entering the loop**, not every iteration
+- Start as a background subshell with 1-second initial delay
 - Poll every 3-5 seconds for build-related processes
-- Self-test: verify its own tooling (e.g., PowerShell) works before entering the loop
+- Parameterize the process name list for the build system in use (msbuild/cl/link, ninja/cmake, gcc/g++, etc.)
 - Trap-based cleanup: `trap cleanup INT TERM EXIT` — no leaked processes on Ctrl-C
-- Exit condition: stop when no build processes remain
-- Initial delay: 1 second (not 3+ — fast incremental builds may finish before the watchdog starts)
+- Exit condition: stop when no build processes remain (poll twice with a short gap before exiting to avoid race with slow process startup)
+
+### Build-system-specific notes
+
+**CMake**: Use `cmake --build <dir> --config Release` rather than invoking the generator directly. This is portable across Make, Ninja, and MSBuild backends. Clean with `cmake --build <dir> --target clean`.
+
+**Cargo**: Use `cargo build --release`. Target directory is `target/release/` by default but can be overridden with `--target-dir` for coexist builds. `cargo clean` is safe.
+
+**Go**: `go build -o <output> ./cmd/...`. No separate clean needed (Go rebuilds as needed). Use `GOFLAGS=-trimpath` for reproducible builds.
+
+**Node**: Detect package manager (`package-lock.json` → npm, `yarn.lock` → yarn, `pnpm-lock.yaml` → pnpm). Use `ci` not `install` for reproducible builds.
+
+**Make**: `make -j$(nproc)` on Linux, `make -j$(sysctl -n hw.ncpu)` on macOS. Clean with `make clean`.
+
+### Pre-build checks
+- **Locked output files** (Windows): if the target binary is in use, the link step will fail. Check before building and warn the user.
+- **Generated dependencies**: after a clean, verify that generated headers/configs exist before building. A stale generated file from a different config can cause silent corruption.
 
 ### Script structure template
 ```bash
@@ -96,13 +150,14 @@ set -euo pipefail
 
 # 1. Toolchain discovery (never assume PATH)
 # 2. Argument parsing (workspace, target, options)
-# 3. Validation (solution/project file exists, workspace exists)
-# 4. Priority watchdog (if applicable, with trap cleanup)
+# 3. Validation (project file exists, workspace exists, output not locked)
+# 4. Priority enforcement (nice on Linux/macOS, watchdog on Windows)
 # 5. Clean phase (separate invocation, if requested)
-# 6. Build phase (direct invocation, output to stdout/stderr)
-# 7. Result checking (exit code, staleness, artifact existence)
-# 8. Snapshot (if requested, with integrity verification)
-# 9. Summary
+# 6. Echo build command
+# 7. Build phase (direct invocation, output to stdout/stderr)
+# 8. Result checking (exit code, staleness, artifact existence)
+# 9. Snapshot (if requested, with integrity verification)
+# 10. Summary
 ```
 
 ## Phase 3 — Review Pipeline
@@ -111,21 +166,25 @@ After the script is written, run reviews in parallel:
 
 ### Gimli (Sonnet) — Build system review
 - Will the toolchain invocation work in the target shell?
-- Are there flag-mangling risks? (MSYS2 `/` → path conversion)
-- Will the watchdog catch all child processes?
+- Are there flag-mangling or path-conversion risks?
+- Will priority enforcement catch all child processes?
 - Is error handling correct under `set -euo pipefail`?
-- Are there race conditions?
+- Are there race conditions in the watchdog or staleness check?
+- Is timestamp comparison portable for the target OS?
 
 ### Aragorn (Sonnet) — Security and robustness review
-- Are paths properly quoted for spaces?
+- Are paths properly quoted for spaces and special characters?
 - Is the script injection-safe? (no unquoted `$vars` in commands)
 - Will it handle unexpected process states gracefully?
 - Does it avoid destructive operations without confirmation?
 
-### Uruk-Hai (Haiku) — Adversarial testing
+### Adversarial testing (Sonnet) — Shell and error-mode analysis
 - What happens with missing tools, empty directories, wrong arguments?
 - What happens if the build is already running?
 - What happens on Ctrl-C at various points?
+- How do `set -e`, traps, and `|| EXIT_CODE=$?` interact? (This requires Sonnet-level reasoning, not Haiku.)
+
+If reviewers conflict, resolve by priority: security > correctness > ergonomics. Escalate to user if the conflict is a genuine trade-off.
 
 Apply fixes from all reviewers before proceeding.
 
@@ -146,7 +205,7 @@ For background builds, use `run_in_background: true` on the Bash tool.
 ### Post-build checklist
 1. Check exit code
 2. Check staleness warnings
-3. If snapshot requested, verify MD5 match
+3. If snapshot requested, verify integrity match
 4. Report to user: what compiled, how long, any warnings
 5. If build failed: read error output, diagnose, suggest fix
 
@@ -158,9 +217,10 @@ After the harness is created or updated:
 Create/update a reference memory file with:
 - Script path
 - Usage examples for common operations
-- Worktree shortcuts
+- Workspace/worktree shortcuts
 - Target shortcuts
 - Known pitfalls and their mitigations
+- Platform and shell the script was written for
 
 ### Update MEMORY.md index
 Add a one-line pointer to the memory file.
@@ -173,10 +233,10 @@ When the build environment changes (new worktree, new toolchain, new preferences
 After the first successful build with the harness, ask the user:
 
 > The harness is working. A few questions to make it better:
-> 1. Want notification sounds or desktop toast on build completion?
+> 1. Want notification on build completion? (sound, desktop toast, terminal bell)
 > 2. Want automatic `git stash` before clean builds?
 > 3. Want build timing history logged to a file?
-> 4. Want the script to auto-detect which target to build based on changed files?
+> 4. Want the script to auto-detect which target to build based on changed files? (Note: this requires encoding the dependency graph for multi-layer builds — simple for single-target projects, complex for projects with lib→dll→app chains.)
 > 5. Anything else that would make builds less annoying?
 
 Save responses as feedback memories.
@@ -186,12 +246,12 @@ Save responses as feedback memories.
 | Activity | Tier | Why |
 |----------|------|-----|
 | Workspace scan | Haiku | Fast, mechanical file discovery |
-| Script generation | Sonnet | Balanced — needs build system knowledge |
-| Gimli review | Sonnet | Build system expertise |
-| Aragorn review | Sonnet | Security and robustness |
-| Adversarial test | Haiku | Fast, numerous edge cases |
+| Script generation | Sonnet | Needs build system and platform knowledge |
+| Build system review | Sonnet | Platform-specific expertise |
+| Security review | Sonnet | Robustness analysis |
+| Adversarial / error-mode testing | Sonnet | Shell error handling requires depth, not speed |
 | Build execution | Direct (no agent) | Just a bash command |
-| Error diagnosis | Sonnet | Needs context about build systems |
+| Error diagnosis | Sonnet | Needs build system context |
 | Architecture review | Opus | Only if the build system is complex or unusual |
 
 ## Post-Compaction Recovery
@@ -205,15 +265,3 @@ The entire point of the memory system is that after compaction, the next session
 No rediscovery needed. No reinventing the wheel. The script and the memory are the continuity mechanism.
 
 If the memory says the script exists but it doesn't (deleted, moved), fall back to Phase 1 and rebuild it. Update the memory when done.
-
-## Reference Implementation
-
-See `D:\ClauDe\orcaPatch\build.sh` — a build harness for OrcaSlicer across three git worktrees, featuring:
-- MSBuild discovery via vswhere + fallback paths
-- MSYS2-safe flag syntax (`-p:` not `/p:`)
-- BelowNormal priority watchdog with trap cleanup
-- Staleness detection (timestamp vs build start)
-- MD5-verified DLL snapshots
-- Coexist parallelism (`-m:4` default, `--afk` for full)
-
-This was developed through three failed build attempts (PATH missing, output swallowed, flags mangled) before the harness got it right on the first try. The harness exists precisely to encode those lessons.
