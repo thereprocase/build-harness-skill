@@ -14,12 +14,28 @@ When you need to build a project, the skill:
 
 ## Key Features
 
-- **Toolchain discovery** — finds compilers by reliable means, never assumes PATH
+- **Toolchain discovery** — finds compilers via `vswhere.exe` (Windows) or standard paths, never assumes PATH
 - **Shell compatibility** — handles MSYS2/Git Bash flag mangling (`-p:` not `/p:`)
-- **Priority enforcement** — watchdog process keeps builds at BelowNormal/nice
-- **Staleness detection** — warns when artifacts weren't actually updated
-- **Artifact snapshots** — copies output with MD5 verification
+- **Priority enforcement** — watchdog process keeps builds at BelowNormal/nice, catches child processes
+- **Staleness detection** — warns when artifacts weren't actually updated by the build
+- **Full artifact snapshots** — copies entire Release directory with `{hash}_{note}` naming and MD5 verification
 - **Post-compaction recovery** — memory files let new sessions use existing harnesses immediately
+
+## The Skill Workflow
+
+The skill operates in six phases, each assigned an appropriate model tier:
+
+| Phase | Activity | Model Tier |
+|-------|----------|------------|
+| 0 | Check memory for existing harness | Direct (no agent) |
+| 1 | Workspace discovery (build system, toolchain, layout) | Haiku (fast scan) |
+| 2 | Script generation | Sonnet (build expertise) |
+| 3 | Review pipeline (Gimli + Aragorn + adversarial) | Sonnet + Haiku |
+| 4 | Execute build with monitoring | Direct (bash) |
+| 5 | Persist harness to memory | Direct (write) |
+| 6 | Interview user about preferences (first time) | Direct (ask) |
+
+Phase 0 is the key to surviving conversation compaction — the harness and its usage are stored in a memory file, so a fresh session can find and use it without rediscovery.
 
 ## Installation
 
@@ -32,33 +48,64 @@ cp SKILL.md ~/.claude/skills/build-harness/
 
 The skill auto-registers and triggers on build-related requests.
 
-## Example
+## Reference Implementation
 
-See `examples/orcaslicer_build.sh` for a reference implementation — a build harness for OrcaSlicer across three git worktrees with MSBuild on Windows.
+See `examples/orcaslicer_build.sh` — a build harness for OrcaSlicer across three git worktrees with MSBuild on Windows.
 
 ```bash
-# Incremental lib build
+# Incremental lib build (fastest, after editing one .cpp)
 ./build.sh snuggle lib
 
-# Full DLL build with snapshot
-./build.sh snuggle dll --snapshot
+# Build DLL with full snapshot to builds/{hash}_{note}/
+./build.sh snuggle dll --snapshot --note=radial_snuggle
 
-# AFK full rebuild
+# Clean rebuild, all cores (AFK only)
 ./build.sh v1 all --afk --clean
+
+# Snapshot with auto-generated note from commit message
+./build.sh v2 dll --snapshot
 ```
+
+### Snapshot format
+
+Snapshots copy the entire Release directory (all DLLs, resources, ~664MB) into a folder named `{10-char-hash}_{descriptive_note}`:
+
+```
+builds/
+  bf2c3ddb85_radial_snuggle_clean/
+    OrcaSlicer.dll
+    TKBO.dll
+    TKBRep.dll
+    ...
+    resources/
+  a3c7b4b062_snuggle_adaptive/
+    ...
+```
+
+The DLL is MD5-verified against the build output. The commit hash and message are printed so you know exactly what code produced the snapshot.
 
 ## Review History
 
-The skill and reference implementation were reviewed by:
-- **Gimli** (build system specialist) — 16 findings, 3 HIGH
-- **Gandalf** (architecture) — 7 findings, 0 HIGH
-- **Aragorn** (security/robustness) — included in Gimli's scope
+The skill and reference implementation were reviewed by the [Lord of the Code](https://github.com/thereprocase) framework:
 
-Key fixes applied from reviews:
-- Clean phase runs as separate MSBuild invocation (not appended to target)
+- **Gimli** (Sonnet, build systems) — 16 findings, 3 HIGH: watchdog self-test placement, Linux nice/renice gap, locked DLL check
+- **Gandalf** (Sonnet, architecture) — 7 findings: Phase 0 probe step, model tier for adversarial testing, multi-build-system template gaps
+- **Aragorn** (security/robustness) — scoped into Gimli's review
+
+Key fixes applied:
+- Clean phase runs as separate MSBuild invocation (not appended to target list)
 - Watchdog has trap-based cleanup (no leaked processes on Ctrl-C)
 - `BUILD_EXIT=$?` capture pattern prevents `set -e` from killing the script before cleanup
-- MSYS2 flag mangling documented with `-` prefix solution
+- MSYS2 flag mangling handled with `-` prefix (not `/`) for all MSBuild switches
+- Staleness detection compares artifact timestamps against build start time
+- Full Release directory snapshots with `{hash}_{note}` naming convention
+
+## Known Limitations
+
+- Priority watchdog is Windows-only (PowerShell). Linux/macOS should use `nice -n 10` on the build command instead.
+- `stat -c` syntax is GNU (Linux/MSYS2). BSD (macOS) uses `stat -f`.
+- No pre-build check for locked DLL/EXE (will fail at link time if OrcaSlicer is running).
+- `vswhere` drive letter lowercasing uses GNU sed `\L` — won't work with BSD sed.
 
 ## License
 

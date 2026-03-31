@@ -19,7 +19,8 @@
 #   --afk          Use all cores (no -m:4 limit)
 #   --clean        Clean before building
 #   --verbose      Use normal verbosity instead of minimal
-#   --snapshot     Copy DLL to builds/ and MD5-check after build
+#   --snapshot     Copy full Release dir to orcaPatch/builds/{hash}_{note}/
+#   --note=TEXT    Descriptive note for snapshot folder (auto-generated if omitted)
 #   --no-priority  Skip BelowNormal priority enforcement
 #
 # Examples:
@@ -114,12 +115,14 @@ PARALLEL="-m:4"
 DO_CLEAN=false
 VERBOSITY="minimal"
 SNAPSHOT=false
+SNAP_NOTE=""
 ENFORCE_PRIORITY=true
 
 for opt in "$@"; do
     case "$opt" in
         --afk)          PARALLEL="-m" ;;
         --clean)        DO_CLEAN=true ;;
+        --note=*)       SNAP_NOTE="${opt#--note=}" ;;
         --verbose)      VERBOSITY="normal" ;;
         --snapshot)     SNAPSHOT=true ;;
         --no-priority)  ENFORCE_PRIORITY=false ;;
@@ -242,25 +245,45 @@ if [[ -f "$LIB" ]]; then
 fi
 
 # ── Snapshot ─────────────────────────────────────────────────
+# Copies the full Release directory (all DLLs + resources) into
+# D:\ClauDe\orcaPatch\builds\{hash}_{note}
+# matching the established snapshot structure.
 if [[ "$SNAPSHOT" = true && -f "$DLL" ]]; then
-    BRANCH=$(cd "$WORKTREE" && git branch --show-current 2>/dev/null | sed 's|/|-|g' || echo "unknown")
-    GIT_HASH=$(cd "$WORKTREE" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-    SNAP_DIR="/d/ClauDe/builds/$BRANCH"
-    mkdir -p "$SNAP_DIR"
+    GIT_HASH=$(cd "$WORKTREE" && git rev-parse --short=10 HEAD 2>/dev/null || echo "unknown")
 
-    cp "$DLL" "$SNAP_DIR/OrcaSlicer.dll"
+    if [[ -z "$SNAP_NOTE" ]]; then
+        # Auto-generate note from last commit message (first word after type prefix)
+        SNAP_NOTE=$(cd "$WORKTREE" && git log --format=%s -1 2>/dev/null \
+            | sed 's/^[^:]*: //' | tr ' ' '_' | tr -cd 'a-zA-Z0-9_' | head -c 40 || echo "snapshot")
+    fi
 
+    SNAP_DIR="/d/ClauDe/orcaPatch/builds/${GIT_HASH}_${SNAP_NOTE}"
+    RELEASE_DIR="$WORKTREE/build/src/Release"
+
+    if [[ -d "$SNAP_DIR" ]]; then
+        echo "WARNING: Snapshot directory already exists: $SNAP_DIR"
+        echo "  Overwriting..."
+        rm -rf "$SNAP_DIR"
+    fi
+
+    echo ""
+    echo "Snapshotting Release directory..."
+    cp -r "$RELEASE_DIR" "$SNAP_DIR"
+
+    # Verify the key artifact
     SRC_MD5=$(md5sum "$DLL" | cut -d' ' -f1)
     DST_MD5=$(md5sum "$SNAP_DIR/OrcaSlicer.dll" | cut -d' ' -f1)
+    FILE_COUNT=$(ls "$SNAP_DIR" | wc -l)
+    SNAP_SIZE=$(du -sh "$SNAP_DIR" | cut -f1)
 
     if [[ "$SRC_MD5" = "$DST_MD5" ]]; then
-        echo ""
-        echo "Snapshot OK: $SNAP_DIR/OrcaSlicer.dll"
+        echo "Snapshot OK: $SNAP_DIR"
         echo "  Commit: $GIT_HASH ($(cd "$WORKTREE" && git log --oneline -1 2>/dev/null || echo 'unknown'))"
-        echo "  MD5 verified: $SRC_MD5"
+        echo "  Files: $FILE_COUNT ($SNAP_SIZE)"
+        echo "  DLL MD5: $SRC_MD5"
     else
         echo ""
-        echo "SNAPSHOT FAILED: MD5 mismatch!"
+        echo "SNAPSHOT FAILED: DLL MD5 mismatch!"
         echo "  Source: $SRC_MD5"
         echo "  Dest:   $DST_MD5"
         exit 1
