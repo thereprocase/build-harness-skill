@@ -109,6 +109,7 @@ case "$TARGET_ARG" in
         ;;
 esac
 
+
 # ── Parse options ────────────────────────────────────────────
 # MSYS2 doesn't mangle -m:4 (no leading /), but be consistent
 PARALLEL="-m:4"
@@ -131,6 +132,16 @@ for opt in "$@"; do
             ;;
     esac
 done
+
+# --snapshot needs a runnable build. Upgrade lib/dll to gui so orca-slicer.exe exists.
+if [[ "$SNAPSHOT" = true ]]; then
+    case "${MSBUILD_TARGET:-}" in
+        libslic3r|OrcaSlicer)
+            echo "NOTE: --snapshot requires orca-slicer.exe. Upgrading target to gui."
+            MSBUILD_TARGET="OrcaSlicer_app_gui"
+            ;;
+    esac
+fi
 
 echo ""
 echo "Target: ${MSBUILD_TARGET:-all}"
@@ -269,6 +280,31 @@ if [[ "$SNAPSHOT" = true && -f "$DLL" ]]; then
     echo ""
     echo "Snapshotting Release directory..."
     cp -r "$RELEASE_DIR" "$SNAP_DIR"
+
+    # Remove build-only artifacts that aren't needed to run
+    rm -f "$SNAP_DIR"/OrcaSlicer.exp "$SNAP_DIR"/OrcaSlicer.lib "$SNAP_DIR"/OrcaSlicer.pdb 2>/dev/null
+
+    # Copy VC runtime DLLs (required to run, not produced by the build)
+    VC_REDIST=""
+    if [[ -f "$MSBUILD" ]]; then
+        # Find the VS install root from MSBuild path, then locate the latest VC redist
+        VS_ROOT=$(echo "$MSBUILD" | sed 's|/MSBuild/.*||')
+        REDIST_BASE="$VS_ROOT/VC/Redist/MSVC"
+        if [[ -d "$REDIST_BASE" ]]; then
+            VC_REDIST=$(ls -d "$REDIST_BASE"/*/x64/Microsoft.VC*.CRT 2>/dev/null | sort -V | tail -1)
+        fi
+    fi
+    if [[ -n "$VC_REDIST" && -d "$VC_REDIST" ]]; then
+        cp "$VC_REDIST"/*.dll "$SNAP_DIR/" 2>/dev/null
+        echo "  VC runtime: copied from $VC_REDIST"
+    else
+        echo "  WARNING: VC runtime DLLs not found — snapshot may not run standalone"
+    fi
+
+    # Verify runnable
+    if [[ ! -f "$SNAP_DIR/orca-slicer.exe" ]]; then
+        echo "  WARNING: orca-slicer.exe missing from snapshot — build gui target first"
+    fi
 
     # Verify the key artifact
     SRC_MD5=$(md5sum "$DLL" | cut -d' ' -f1)
